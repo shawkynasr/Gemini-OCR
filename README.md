@@ -17,7 +17,7 @@
 
 ## 🚀 طريقة الاستخدام للمستخدم العادي (User Guide)
 
-1.  قم بتحميل البرنامج (ملف `exe`) من قسم **[Releases](https://github.com/USERNAME/REPO_NAME/releases)** على يمين الصفحة.
+1.  قم بتحميل البرنامج (ملف `exe`) من قسم **[Releases](https://github.com/the-cataloger/Gemini-OCR-Arabic/releases)** على يمين الصفحة.
 2.  احصل على مفتاح API مجاني من [Google AI Studio](https://aistudio.google.com/app/apikey).
 3.  افتح البرنامج وأدخل المفتاح.
 4.  اختر الصور أو ملف PDF واضغط "إرسال".
@@ -30,8 +30,8 @@
 
 1.  **استنساخ المستودع:**
     ```bash
-    git clone [https://github.com/USERNAME/Gemini-OCR-Arabic.git](https://github.com/USERNAME/Gemini-OCR-Arabic.git)
-    cd REPO_NAME
+    git clone [https://github.com/the-cataloger/Gemini-OCR-Arabic.git](https://github.com/the-cataloger/Gemini-OCR-Arabic.git)
+    cd Gemini-OCR-Arabic
     ```
 
 2.  **تثبيت المكتبات المطلوبة:**
