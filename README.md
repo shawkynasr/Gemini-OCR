@@ -2,6 +2,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![Gemini API](https://img.shields.io/badge/AI-Gemini%201.5-orange)
+[English](./README_EN.md) | [中文](./README_CN.md)
 
 أداة سطح مكتب (Desktop App) لاستخراج النصوص العربية من الصور وملفات PDF بدقة عالية جداً، مع الحفاظ على تنسيق الفقرات والجداول، باستخدام تقنيات Google Gemini AI.
 
