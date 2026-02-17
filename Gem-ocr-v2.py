@@ -1,11 +1,5 @@
 import sys
 import os
-# --- Fix for Users in China ---
-# This forces the app to use the local VPN proxy tunnel
-# 7890 is the default for Clash; 10809 is the default for v2ray
-os.environ["http_proxy"] = "http://127.0.0.1:7890"
-os.environ["https_proxy"] = "http://127.0.0.1:7890"
-# ------------------------------
 import google.generativeai as genai
 import PIL.Image
 import PIL.ImageOps
