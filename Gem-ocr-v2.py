@@ -1,5 +1,6 @@
 import sys
 import os
+import requests  # <== Added for connection testing
 import google.generativeai as genai
 import PIL.Image
 import PIL.ImageOps
@@ -64,7 +65,7 @@ class RequestWorker(QObject):
                  pdf_dpi=300, image_batch_size=10, delay_seconds=60, 
                  process_images_binarization=False, process_images_denoising=False,
                  process_images_resize_factor=1.0, 
-                 all_pages=True, start_page=1, end_page=1): # <== New additions
+                 all_pages=True, start_page=1, end_page=1): 
         super().__init__()
         self.api_key = api_key; self.model_name = model_name; self.prompt_text = prompt_text
         self.image_paths = image_paths if image_paths else []; self.file_path = file_path
@@ -74,7 +75,6 @@ class RequestWorker(QObject):
         self.PROCESS_DENOISING = process_images_denoising
         self.RESIZE_FACTOR = process_images_resize_factor
         
-        # --- New Page Range Variables ---
         self.ALL_PAGES = all_pages
         self.START_PAGE = start_page
         self.END_PAGE = end_page
@@ -83,23 +83,23 @@ class RequestWorker(QObject):
         """Apply pre-processing filters (Resize, Otsu Binarization, Denoising)."""
         img_processed = img.copy()
 
-        # 1. Resize first (to speed up processing and control size)
+        # 1. Resize first
         if self.RESIZE_FACTOR < 1.0:
             new_size = (int(img_processed.width * self.RESIZE_FACTOR), 
                         int(img_processed.height * self.RESIZE_FACTOR))
             img_processed = img_processed.resize(new_size, PIL.Image.Resampling.LANCZOS)
             self.status_update.emit(f"... Image resized by factor: {self.RESIZE_FACTOR * 100:.0f}%")
 
-        # 2. Convert to OpenCV (numpy array)
+        # 2. Convert to OpenCV
         img_np = np.array(img_processed)
         
-        # 3. Convert to Grayscale (if not already)
+        # 3. Convert to Grayscale
         if img_np.ndim == 3:
              img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
         else:
              img_gray = img_np
 
-        # 4. Advanced Binary Thresholding (Otsu's Binarization)
+        # 4. Advanced Binary Thresholding
         if self.PROCESS_BINARIZATION:
             _, img_thresh = cv2.threshold(img_gray, 0, 255, 
                                           cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -108,16 +108,11 @@ class RequestWorker(QObject):
         else:
             img_np = img_gray 
 
-        # 5. Morphological Denoising (Salt & Pepper)
+        # 5. Morphological Denoising
         if self.PROCESS_DENOISING and img_np.ndim == 2:
             kernel = np.ones((2, 2), np.uint8) 
-            
-            # Opening: Removes white dots (salt noise)
             img_np = cv2.morphologyEx(img_np, cv2.MORPH_OPEN, kernel, iterations=1)
-            
-            # Closing: Removes black dots/fills small holes (pepper noise)
             img_np = cv2.morphologyEx(img_np, cv2.MORPH_CLOSE, kernel, iterations=1)
-            
             self.status_update.emit("... Applying morphological noise reduction ...")
 
         # 6. Convert back to PIL Image
@@ -130,15 +125,12 @@ class RequestWorker(QObject):
         self.status_update.emit(f"... ⏳ Converting PDF to images at {self.PDF_DPI} DPI...")
         images = []; doc = fitz.open(self.file_path)
         
-        # --- Apply modified page range ---
         num_pages = len(doc)
-        start_index = 0  # Page 1 in PDF is index 0
+        start_index = 0
         end_index = num_pages - 1
 
         if not self.ALL_PAGES:
-            # Pages start from 1 for user, but fitz starts from 0
             start_index = max(0, self.START_PAGE - 1) 
-            # (End page is inclusive, so no need to add 1 later for range limit)
             end_index = min(num_pages - 1, self.END_PAGE - 1) 
             
             if start_index > end_index:
@@ -149,12 +141,10 @@ class RequestWorker(QObject):
         else:
              self.status_update.emit(f"... Processing all PDF pages: {num_pages} pages.")
         
-        # Iterate only over the specified range (End is inclusive, so +1)
         for i in range(start_index, end_index + 1): 
             page = doc[i] 
             pix = page.get_pixmap(dpi=self.PDF_DPI)
             img = PIL.Image.frombytes("RGB", [pix.width, pix.height], pix.samples) 
-            
             img_processed = self.process_single_image(img) 
             images.append(img_processed)
             
@@ -166,13 +156,13 @@ class RequestWorker(QObject):
             genai.configure(api_key=self.api_key); model = genai.GenerativeModel(self.model_name)
             prompt = self.prompt_text; images_to_process = []
             
-            # 1. Process Attached Images (Single or Folder)
+            # 1. Process Attached Images
             if self.image_paths: 
                 for p in self.image_paths:
                     img = PIL.Image.open(p)
                     images_to_process.append(self.process_single_image(img)) 
             
-            # 2. Process File (PDF)
+            # 2. Process File
             if self.file_path:
                 file_ext = os.path.splitext(self.file_path)[1].lower()
                 if file_ext == '.pdf':
@@ -183,7 +173,7 @@ class RequestWorker(QObject):
 
             if not images_to_process: raise Exception("No images or PDF found for OCR processing.")
             
-            # 3. Create Jobs (Batching images)
+            # 3. Create Jobs
             jobs = []
             image_batches = [images_to_process[i:i+self.IMAGE_BATCH_SIZE] 
                              for i in range(0, len(images_to_process), self.IMAGE_BATCH_SIZE)]
@@ -221,7 +211,7 @@ class RequestWorker(QObject):
 class GeminiApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Gemini-OCR By (Thecataloger) manuscriptscataloger@gmail.com")
+        self.setWindowTitle("Gemini-OCR V2 By (Shawky Nasr) shawkynasr@126.com")
         self.setGeometry(100, 100, 1200, 800)
         self.setLayoutDirection(Qt.LeftToRight) # Set Layout to LTR
 
@@ -231,7 +221,6 @@ class GeminiApp(QMainWindow):
             "models/gemini-pro-latest", "models/gemini-flash-latest",
         ]
         
-        # Professional and General OCR Prompt
         self.DEFAULT_OCR_PROMPT = """You are an advanced Optical Character Recognition (OCR) engine. Your task is to extract the *full and accurate* text content from the attached images (book pages/documents).
 
 **Key Instructions:**
@@ -259,10 +248,32 @@ class GeminiApp(QMainWindow):
         
         api_layout = QHBoxLayout()
         api_label = QLabel("🔑 Google AI Key:")
-        self.api_key_input = QLineEdit(); self.api_key_input.setPlaceholderText("Enter your key..."); self.api_key_input.setEchoMode(QLineEdit.Password) 
-        self.import_key_button = QPushButton("Import..."); self.import_key_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        api_layout.addWidget(api_label); api_layout.addWidget(self.api_key_input); api_layout.addWidget(self.import_key_button) 
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setPlaceholderText("Enter your key...")
+        self.api_key_input.setEchoMode(QLineEdit.Password) 
+        
+        # --- NEW: Test Connection Button ---
+        self.test_conn_button = QPushButton("⚡ Test Connection")
+        self.test_conn_button.clicked.connect(self.test_connection)
+        
+        self.import_key_button = QPushButton("Import...")
+        self.import_key_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        
+        api_layout.addWidget(api_label)
+        api_layout.addWidget(self.api_key_input)
+        api_layout.addWidget(self.test_conn_button)
+        api_layout.addWidget(self.import_key_button) 
         left_column_layout.addLayout(api_layout)
+
+        # --- NEW: Proxy Settings UI ---
+        proxy_layout = QHBoxLayout()
+        proxy_label = QLabel("🌐 Local Proxy (e.g., 127.0.0.1:8888):")
+        self.proxy_input = QLineEdit()
+        self.proxy_input.setPlaceholderText("Leave empty if not in China")
+        proxy_layout.addWidget(proxy_label)
+        proxy_layout.addWidget(self.proxy_input)
+        left_column_layout.addLayout(proxy_layout)
+        # ------------------------------
 
         model_layout = QHBoxLayout()
         model_label = QLabel("🤖 Select Model:")
@@ -465,6 +476,8 @@ class GeminiApp(QMainWindow):
         self.dpi_spin.setValue(300); self.resize_factor_spin.setValue(1.0)
         self.image_batch_spin.setValue(10); self.delay_spin.setValue(60)
         
+        self.proxy_input.clear() # Clear proxy input too
+        
         # --- Reset Page Range Options ---
         self.all_pages_checkbox.setChecked(True)
         self.start_page_spin.setValue(1)
@@ -497,7 +510,6 @@ class GeminiApp(QMainWindow):
 
     @Slot()
     def open_image_dialog(self):
-        # Allow selecting folder or multiple files
         dialog = QFileDialog(self)
         dialog.setFileMode(QFileDialog.ExistingFiles) 
         dialog.setOption(QFileDialog.DontUseNativeDialog, True)
@@ -508,7 +520,7 @@ class GeminiApp(QMainWindow):
         h_layout = QHBoxLayout()
         h_layout.addWidget(open_folder_button)
         try:
-             dialog.layout().addWidget(open_folder_button) # Try adding as widget
+             dialog.layout().addWidget(open_folder_button)
         except Exception:
              pass 
 
@@ -556,14 +568,13 @@ class GeminiApp(QMainWindow):
             self.current_file_path = None
             self.file_preview_label.setText("No file selected.")
             
-        # Try reading PDF pages to set limits
         if file_path:
             try:
                 doc = fitz.open(file_path)
                 num_pages = len(doc)
                 self.start_page_spin.setRange(1, num_pages)
                 self.end_page_spin.setRange(1, num_pages)
-                self.end_page_spin.setValue(num_pages) # Set stop to max pages
+                self.end_page_spin.setValue(num_pages) 
                 self.append_to_log(f"Detected {num_pages} pages in PDF.")
                 doc.close()
             except Exception as e:
@@ -574,10 +585,67 @@ class GeminiApp(QMainWindow):
         self.check_inputs()
 
     @Slot()
+    def test_connection(self):
+        api_key = self.api_key_input.text().strip()
+        if not api_key:
+            self.append_to_log("❌ Error: Enter an API Key first to test the connection.")
+            self.status_bar.showMessage("❌ Missing API Key", 3000)
+            return
+
+        self.append_to_log("🔍 Testing connection to Google API...")
+        self.test_conn_button.setEnabled(False)
+        self.status_bar.showMessage("Testing connection...", 0)
+        
+        # Check if the user has environment proxies set in the UI
+        proxies = {}
+        user_proxy = self.proxy_input.text().strip()
+        if user_proxy:
+            if not user_proxy.startswith("http"):
+                user_proxy = f"http://{user_proxy}"
+            proxies = {"http": user_proxy, "https": user_proxy}
+            self.append_to_log(f"... Using local proxy tunnel: {user_proxy}")
+
+        try:
+            # Send a fast, lightweight request to check the connection
+            test_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+            response = requests.get(test_url, proxies=proxies, timeout=10)
+            
+            if response.status_code == 200:
+                self.append_to_log("✅ Connection Successful! Google server reached.")
+                self.status_bar.showMessage("✅ Connection Success", 5000)
+            else:
+                self.append_to_log(f"⚠️ Server reached but returned error {response.status_code}: {response.text}")
+                self.status_bar.showMessage(f"⚠️ API Error: {response.status_code}", 5000)
+                
+        except requests.exceptions.Timeout:
+            self.append_to_log("❌ Connection Timeout: Google is blocked. Check your VPN/Proxy.")
+            self.status_bar.showMessage("❌ Connection Timeout", 5000)
+        except Exception as e:
+            self.append_to_log(f"❌ Connection Failed: {str(e)}")
+            self.status_bar.showMessage("❌ Connection Failed", 5000)
+        finally:
+            self.test_conn_button.setEnabled(True)
+
+    @Slot()
     def start_request(self):
         self.append_to_log("Starting OCR request process...")
         self.send_button.setEnabled(False)
         self.response_output.clear() 
+        
+        # --- NEW: Apply the proxy dynamically ---
+        user_proxy = self.proxy_input.text().strip()
+        if user_proxy:
+            if not user_proxy.startswith("http"):
+                user_proxy = f"http://{user_proxy}"
+            os.environ["http_proxy"] = user_proxy
+            os.environ["https_proxy"] = user_proxy
+            self.append_to_log(f"Routing traffic through proxy: {user_proxy}")
+        else:
+            # Clear it out so direct connections work for normal users
+            os.environ.pop("http_proxy", None)
+            os.environ.pop("https_proxy", None)
+        # ----------------------------------------
+        
         api_key = self.api_key_input.text()
         model = self.model_combo.currentText()
         prompt = self.prompt_input.toPlainText()
@@ -592,14 +660,12 @@ class GeminiApp(QMainWindow):
         image_batch_size = self.image_batch_spin.value()
         delay_seconds = self.delay_spin.value() 
         
-        # --- Collect new PDF Page Range settings ---
         all_pages = self.all_pages_checkbox.isChecked()
         start_page = self.start_page_spin.value()
         end_page = self.end_page_spin.value()
         
         if not model: self.handle_error("Please select a model from the list first."); return
         
-        # Logic check for page range
         if file_path and not all_pages and start_page > end_page:
             self.handle_error("Logic Error: Start page must be less than or equal to End page.");
             self.send_button.setEnabled(True); return
