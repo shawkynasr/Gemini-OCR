@@ -20,9 +20,9 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QTextEdit, QPushButton, QFileDialog,
     QStatusBar, QFrame, QSizePolicy, QComboBox,
-    QDialog, QCheckBox, QSpinBox, QDoubleSpinBox
+    QDialog, QCheckBox, QSpinBox, QDoubleSpinBox, QMessageBox  # <== NEW: Added QMessageBox for popups
 )
-from PySide6.QtGui import QPixmap, QCloseEvent
+from PySide6.QtGui import QPixmap
 
 # --- (1. Image Preview Dialog) ---
 class ImagePreviewDialog(QDialog):
@@ -87,6 +87,7 @@ class RequestWorker(QObject):
     error = Signal(str)
     status_update = Signal(str)
     completed_all = Signal()
+    issues_report = Signal(list) # <== NEW: Signal to send the final error list to the GUI
 
     def __init__(self, api_key, model_name, prompt_text, image_paths, file_path,
                  pdf_dpi=300, image_batch_size=10, delay_seconds=60, 
@@ -185,7 +186,6 @@ class RequestWorker(QObject):
         return slices
 
     def process_single_image(self, img):
-        # 强制转换图片模式，修复特殊 PNG (1位黑白或带有透明通道) 报错
         if img.mode not in ('RGB', 'L'):
             img = img.convert('RGB')
             
@@ -248,7 +248,6 @@ class RequestWorker(QObject):
             img = PIL.Image.frombytes("RGB", [pix.width, pix.height], pix.samples) 
             
             img_processed = self.process_single_image(img) 
-            
             slices = self.split_image_into_columns(img_processed)
             images.extend(slices)
             
@@ -267,8 +266,9 @@ class RequestWorker(QObject):
             if self.image_paths: 
                 for p in self.image_paths:
                     img = PIL.Image.open(p)
+                    if img.mode not in ('RGB', 'L'):
+                        img = img.convert('RGB')
                     img_processed = self.process_single_image(img)
-                    
                     slices = self.split_image_into_columns(img_processed)
                     images_to_process.extend(slices)
             
@@ -289,7 +289,16 @@ class RequestWorker(QObject):
             for batch in image_batches: 
                 jobs.append( {"type": "image_batch", "content": batch} )
 
+            custom_safety_settings = [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+            ]
+
             total_jobs = len(jobs)
+            issues_found = []  # <== NEW: List to track all issues silently during the loop
+
             for i, job in enumerate(jobs):
                 job_content = job["content"]
                 self.status_update.emit(f"... 🚀 Sending image batch {i+1} of {total_jobs}...")
@@ -297,26 +306,53 @@ class RequestWorker(QObject):
                 payload = [prompt] 
                 payload.extend(job_content) 
                 
-                response = model.generate_content(payload)
-                
-                if response.candidates and response.candidates[0].finish_reason == 2:
-                    raise Exception(f"Job {i+1} stopped due to Safety filters. Input or output blocked.")
-                try: 
-                    text_response = response.text
-                except Exception as e: 
-                    if response.prompt_feedback.block_reason:
-                        raise Exception(f"Job {i+1} failed due to prompt blocking: {response.prompt_feedback.block_reason}.")
-                    raise Exception(f"Job {i+1} returned empty response. Error: {e}")
-                
-                self.finished.emit(f"--- OCR Result (Batch {i+1}/{total_jobs}) ---\n{text_response}")
+                try:
+                    response = model.generate_content(payload, safety_settings=custom_safety_settings)
+                    
+                    if not response.candidates:
+                        text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Google API completely blocked this page.]\n"
+                        self.status_update.emit(f"❌ Warning: Batch {i+1} blocked by API.")
+                        issues_found.append(f"Batch {i+1}: Blocked by API (Empty response)")
+                    else:
+                        finish_reason = response.candidates[0].finish_reason
+                        
+                        if finish_reason == 3:
+                            text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Blocked by Google SAFETY filters.]\n"
+                            self.status_update.emit(f"❌ Warning: Batch {i+1} blocked (SAFETY).")
+                            issues_found.append(f"Batch {i+1}: Blocked by SAFETY filters")
+                        elif finish_reason == 8:
+                            text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Blocked by Google PROHIBITED_CONTENT.]\n"
+                            self.status_update.emit(f"❌ Warning: Batch {i+1} blocked (PROHIBITED).")
+                            issues_found.append(f"Batch {i+1}: Blocked by PROHIBITED_CONTENT")
+                        elif finish_reason == 2:
+                            text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Reached MAX_TOKENS limit.]\n"
+                            self.status_update.emit(f"❌ Warning: Batch {i+1} stopped (MAX TOKENS).")
+                            issues_found.append(f"Batch {i+1}: Stopped due to MAX_TOKENS")
+                        else:
+                            try:
+                                text_response = response.text
+                            except Exception as e:
+                                text_response = f"\n[⚠️ WARNING: Batch {i+1} returned empty text. Error: {e}]\n"
+                                self.status_update.emit(f"❌ Warning: Batch {i+1} extraction failed.")
+                                issues_found.append(f"Batch {i+1}: Text extraction failed ({str(e)})")
+
+                    self.finished.emit(f"--- OCR Result (Batch {i+1}/{total_jobs}) ---\n{text_response}")
+
+                except Exception as api_error:
+                    error_msg = f"\n[⚠️ WARNING: Batch {i+1} Exception - {str(api_error)}]\n"
+                    self.finished.emit(f"--- OCR Result (Batch {i+1}/{total_jobs}) ---\n{error_msg}")
+                    self.status_update.emit(f"❌ API Exception on Batch {i+1}: {str(api_error)}")
+                    issues_found.append(f"Batch {i+1}: Network/API Exception ({str(api_error)})")
                 
                 if i < total_jobs - 1:
                     self.status_update.emit(f"... ⏳ Waiting {self.FREE_TIER_DELAY} seconds (Free Tier Limit)...")
                     time.sleep(self.FREE_TIER_DELAY)
                     
             self.status_update.emit(f"✅ All OCR tasks completed ({total_jobs}).")
-        except Exception as e: 
-            self.error.emit(f"OCR Error: {e}")
+            self.issues_report.emit(issues_found)  # <== NEW: Send the report list to the GUI at the very end
+            
+        except Exception as critical_error: 
+            self.error.emit(f"Critical System Error: {critical_error}")
         finally: 
             self.completed_all.emit()
 
@@ -324,7 +360,7 @@ class RequestWorker(QObject):
 class GeminiApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Gemini-OCR By (Thecataloger) manuscriptscataloger@gmail.com")
+        self.setWindowTitle("Gemini-OCR V2 By (Shawky Nasr) shawkynasr@126.com")
         self.setGeometry(100, 100, 1200, 800)
         self.setLayoutDirection(Qt.LeftToRight) 
 
@@ -347,11 +383,6 @@ class GeminiApp(QMainWindow):
         
         self.current_image_paths = [] 
         self.current_file_path = None
-        
-        # 使用绝对路径，确保在 Mac 和 Windows 打包后都能完美保存配置
-        self.settings_file = os.path.join(os.path.expanduser("~"), ".gemini_ocr_settings.json")
-        
-        self.user_settings = self.load_settings()
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -369,25 +400,19 @@ class GeminiApp(QMainWindow):
         self.api_key_input = QLineEdit()
         self.api_key_input.setPlaceholderText("Enter your key...")
         self.api_key_input.setEchoMode(QLineEdit.Password) 
-        self.api_key_input.setText(self.user_settings.get("api_key", ""))
         
         self.test_conn_button = QPushButton("⚡ Test Connection")
         self.test_conn_button.clicked.connect(self.test_connection)
         
-        self.import_key_button = QPushButton("Import...")
-        self.import_key_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        
         api_layout.addWidget(api_label)
         api_layout.addWidget(self.api_key_input)
         api_layout.addWidget(self.test_conn_button)
-        api_layout.addWidget(self.import_key_button) 
         left_column_layout.addLayout(api_layout)
 
         proxy_layout = QHBoxLayout()
         proxy_label = QLabel("🌐 Local Proxy (e.g., 127.0.0.1:8888):")
         self.proxy_input = QLineEdit()
         self.proxy_input.setPlaceholderText("Leave empty if not in China")
-        self.proxy_input.setText(self.user_settings.get("proxy", ""))
         proxy_layout.addWidget(proxy_label)
         proxy_layout.addWidget(self.proxy_input)
         left_column_layout.addLayout(proxy_layout)
@@ -396,7 +421,6 @@ class GeminiApp(QMainWindow):
         model_label = QLabel("🤖 Select Model:")
         self.model_combo = QComboBox()
         self.model_combo.addItems(self.VLM_MODELS_LIST)
-        self.model_combo.setCurrentIndex(self.user_settings.get("model_index", 0))
         model_layout.addWidget(model_label)
         model_layout.addWidget(self.model_combo)
         left_column_layout.addLayout(model_layout)
@@ -431,7 +455,7 @@ class GeminiApp(QMainWindow):
         pdf_page_range_layout.addWidget(pdf_page_range_label)
         
         self.all_pages_checkbox = QCheckBox("✅ Process **All Pages** (Ignore Start/Stop)")
-        self.all_pages_checkbox.setChecked(self.user_settings.get("all_pages", True))
+        self.all_pages_checkbox.setChecked(True)
         pdf_page_range_layout.addWidget(self.all_pages_checkbox)
         
         range_layout = QHBoxLayout()
@@ -439,16 +463,16 @@ class GeminiApp(QMainWindow):
         range_layout.addWidget(start_page_label)
         self.start_page_spin = QSpinBox()
         self.start_page_spin.setRange(1, 9999)
-        self.start_page_spin.setValue(self.user_settings.get("start_page", 1))
-        self.start_page_spin.setEnabled(not self.all_pages_checkbox.isChecked()) 
+        self.start_page_spin.setValue(1)
+        self.start_page_spin.setEnabled(False) 
         range_layout.addWidget(self.start_page_spin)
         
         end_page_label = QLabel("To Page:")
         range_layout.addWidget(end_page_label)
         self.end_page_spin = QSpinBox()
         self.end_page_spin.setRange(1, 9999)
-        self.end_page_spin.setValue(self.user_settings.get("end_page", 10))
-        self.end_page_spin.setEnabled(not self.all_pages_checkbox.isChecked()) 
+        self.end_page_spin.setValue(10)
+        self.end_page_spin.setEnabled(False) 
         range_layout.addWidget(self.end_page_spin)
         
         pdf_page_range_layout.addLayout(range_layout)
@@ -462,11 +486,11 @@ class GeminiApp(QMainWindow):
         options_layout.addWidget(options_label)
         
         self.binarization_checkbox = QCheckBox("✨ Advanced Binarization (Otsu) - Recommended for books")
-        self.binarization_checkbox.setChecked(self.user_settings.get("binarization", True))
+        self.binarization_checkbox.setChecked(True)
         options_layout.addWidget(self.binarization_checkbox)
         
         self.denoising_checkbox = QCheckBox("🧽 Morphological Noise Reduction (Salt & Pepper)")
-        self.denoising_checkbox.setChecked(self.user_settings.get("denoising", True))
+        self.denoising_checkbox.setChecked(True)
         options_layout.addWidget(self.denoising_checkbox)
         
         # DPI
@@ -476,7 +500,7 @@ class GeminiApp(QMainWindow):
         self.dpi_spin = QSpinBox()
         self.dpi_spin.setRange(150, 600)
         self.dpi_spin.setSingleStep(50)
-        self.dpi_spin.setValue(self.user_settings.get("dpi", 300))
+        self.dpi_spin.setValue(300)
         dpi_layout.addWidget(self.dpi_spin)
         options_layout.addLayout(dpi_layout)
         
@@ -486,7 +510,7 @@ class GeminiApp(QMainWindow):
         self.resize_factor_spin = QDoubleSpinBox()
         self.resize_factor_spin.setRange(0.25, 1.0)
         self.resize_factor_spin.setSingleStep(0.05)
-        self.resize_factor_spin.setValue(self.user_settings.get("resize_factor", 1.0))
+        self.resize_factor_spin.setValue(1.0)
         resize_layout.addWidget(resize_label)
         resize_layout.addWidget(self.resize_factor_spin)
         options_layout.addLayout(resize_layout)
@@ -503,7 +527,7 @@ class GeminiApp(QMainWindow):
         columns_label = QLabel("✂️ Auto Columns (分栏数):")
         self.columns_spin = QSpinBox()
         self.columns_spin.setRange(1, 5)
-        self.columns_spin.setValue(self.user_settings.get("columns", 1))
+        self.columns_spin.setValue(1)
         self.columns_spin.setToolTip("Set to 2 or 3 for multi-column dictionaries.")
         columns_layout.addWidget(columns_label)
         columns_layout.addWidget(self.columns_spin)
@@ -513,7 +537,7 @@ class GeminiApp(QMainWindow):
         image_batch_label = QLabel("Image Batch Size (Pages):")
         self.image_batch_spin = QSpinBox()
         self.image_batch_spin.setRange(1, 50)
-        self.image_batch_spin.setValue(self.user_settings.get("batch_size", 10))
+        self.image_batch_spin.setValue(10)
         image_batch_layout.addWidget(image_batch_label)
         image_batch_layout.addWidget(self.image_batch_spin)
         batch_layout.addLayout(image_batch_layout)
@@ -522,7 +546,7 @@ class GeminiApp(QMainWindow):
         delay_label = QLabel("Wait Delay (Seconds):")
         self.delay_spin = QSpinBox()
         self.delay_spin.setRange(5, 600)
-        self.delay_spin.setValue(self.user_settings.get("delay", 60))
+        self.delay_spin.setValue(60)
         delay_layout.addWidget(delay_label)
         delay_layout.addWidget(self.delay_spin)
         batch_layout.addLayout(delay_layout)
@@ -532,7 +556,7 @@ class GeminiApp(QMainWindow):
         prompt_label = QLabel("💬 3. OCR Text Extraction Prompt:")
         left_column_layout.addWidget(prompt_label)
         self.prompt_input = QTextEdit()
-        self.prompt_input.setText(self.user_settings.get("prompt", self.DEFAULT_OCR_PROMPT))
+        self.prompt_input.setText(self.DEFAULT_OCR_PROMPT)
         self.prompt_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         left_column_layout.addWidget(self.prompt_input)
 
@@ -540,6 +564,13 @@ class GeminiApp(QMainWindow):
         self.send_button.setEnabled(False) 
         self.send_button.setStyleSheet("font-size: 16px; padding: 10px; background-color: #4CAF50; color: white;")
         left_column_layout.addWidget(self.send_button)
+
+        settings_io_layout = QHBoxLayout()
+        self.import_settings_button = QPushButton("📥 Import Settings")
+        self.export_settings_button = QPushButton("📤 Export Settings")
+        settings_io_layout.addWidget(self.import_settings_button)
+        settings_io_layout.addWidget(self.export_settings_button)
+        left_column_layout.addLayout(settings_io_layout)
 
         # --- Fill Right Column (Outputs) ---
         response_label = QLabel("🤖 Model Response (Partial results appear here):")
@@ -577,7 +608,6 @@ class GeminiApp(QMainWindow):
         self.select_image_button.clicked.connect(self.open_image_dialog)
         self.view_images_button.clicked.connect(self.show_image_previewer) 
         self.select_file_button.clicked.connect(self.open_file_dialog)
-        self.import_key_button.clicked.connect(self.open_key_file_dialog)
         self.api_key_input.textChanged.connect(self.check_inputs)
         self.prompt_input.textChanged.connect(self.check_inputs)
         self.response_output.textChanged.connect(self.check_save_button_status)
@@ -585,39 +615,18 @@ class GeminiApp(QMainWindow):
         self.save_button.clicked.connect(self.save_results_to_file)
         self.clear_button.clicked.connect(self.clear_all_inputs)
         
+        self.import_settings_button.clicked.connect(self.import_settings_from_file)
+        self.export_settings_button.clicked.connect(self.export_settings_to_file)
         self.all_pages_checkbox.stateChanged.connect(self.toggle_page_spins) 
         
         self.check_inputs()
         self.check_save_button_status()
-        self.append_to_log("Gemini OCR App started. Settings loaded.")
+        self.append_to_log("Gemini OCR App started. Ready for manual settings import.")
 
-    def load_settings(self):
-        default_settings = {
-            "api_key": "",
-            "proxy": "",
-            "model_index": 0,
-            "prompt": self.DEFAULT_OCR_PROMPT,
-            "binarization": True,
-            "denoising": True,
-            "dpi": 300,
-            "resize_factor": 1.0,
-            "columns": 1,
-            "batch_size": 10,
-            "delay": 60,
-            "all_pages": True,
-            "start_page": 1,
-            "end_page": 10
-        }
-        if os.path.exists(self.settings_file):
-            try:
-                with open(self.settings_file, "r", encoding="utf-8") as f:
-                    loaded_data = json.load(f)
-                    default_settings.update(loaded_data)
-            except Exception as e:
-                print(f"Error loading settings: {e}")
-        return default_settings
-
-    def save_settings(self):
+    @Slot()
+    def export_settings_to_file(self):
+        file_path, _ = QFileDialog.getSaveFileName(self, "Export Settings As...", "", "JSON Files (*.json)")
+        if not file_path: return
         settings = {
             "api_key": self.api_key_input.text().strip(),
             "proxy": self.proxy_input.text().strip(),
@@ -635,14 +644,42 @@ class GeminiApp(QMainWindow):
             "end_page": self.end_page_spin.value()
         }
         try:
-            with open(self.settings_file, "w", encoding="utf-8") as f:
+            with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(settings, f, indent=4, ensure_ascii=False)
+            self.append_to_log(f"✅ Settings successfully exported to: {file_path}")
+            self.status_bar.showMessage("✅ Settings Exported", 5000)
         except Exception as e:
-            print(f"Error saving settings: {e}")
+            self.append_to_log(f"❌ Failed to export settings: {e}")
 
-    def closeEvent(self, event: QCloseEvent):
-        self.save_settings()
-        event.accept()
+    @Slot()
+    def import_settings_from_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Import Settings File", "", "JSON Files (*.json)")
+        if not file_path: return
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            if "api_key" in data: self.api_key_input.setText(data["api_key"])
+            if "proxy" in data: self.proxy_input.setText(data["proxy"])
+            if "model_index" in data: self.model_combo.setCurrentIndex(data["model_index"])
+            if "prompt" in data: self.prompt_input.setText(data["prompt"])
+            if "binarization" in data: self.binarization_checkbox.setChecked(data["binarization"])
+            if "denoising" in data: self.denoising_checkbox.setChecked(data["denoising"])
+            if "dpi" in data: self.dpi_spin.setValue(data["dpi"])
+            if "resize_factor" in data: self.resize_factor_spin.setValue(data["resize_factor"])
+            if "columns" in data: self.columns_spin.setValue(data["columns"])
+            if "batch_size" in data: self.image_batch_spin.setValue(data["batch_size"])
+            if "delay" in data: self.delay_spin.setValue(data["delay"])
+            if "all_pages" in data: 
+                self.all_pages_checkbox.setChecked(data["all_pages"])
+                self.toggle_page_spins(Qt.Checked if data["all_pages"] else Qt.Unchecked)
+            if "start_page" in data: self.start_page_spin.setValue(data["start_page"])
+            if "end_page" in data: self.end_page_spin.setValue(data["end_page"])
+            
+            self.append_to_log(f"✅ Settings successfully imported from: {file_path}")
+            self.status_bar.showMessage("✅ Settings Imported", 5000)
+        except Exception as e:
+            self.append_to_log(f"❌ Failed to import settings: {e}")
 
     @Slot(int)
     def toggle_page_spins(self, state):
@@ -725,15 +762,6 @@ class GeminiApp(QMainWindow):
     @Slot()
     def check_save_button_status(self):
         response_ok = bool(self.response_output.toPlainText().strip()); self.save_button.setEnabled(response_ok)
-
-    @Slot()
-    def open_key_file_dialog(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select API Key File", "", "Text Files (*.txt)")
-        if file_path:
-            try:
-                with open(file_path, "r") as f: key = f.read().strip()
-                if key: self.api_key_input.setText(key); self.append_to_log("API Key loaded from file.")
-            except Exception as e: self.append_to_log(f"ERROR: Failed reading key - {e}")
 
     @Slot()
     def open_image_dialog(self):
@@ -901,6 +929,11 @@ class GeminiApp(QMainWindow):
                                     num_columns) 
         self.worker.moveToThread(self.thread)
         self.worker.status_update.connect(self.append_to_log)
+        
+        # --- NEW: Connect the summary report signal ---
+        self.worker.issues_report.connect(self.show_issues_report)
+        # ----------------------------------------------
+        
         self.thread.started.connect(self.worker.run)
         self.worker.finished.connect(self.handle_partial_response)
         self.worker.error.connect(self.handle_error)
@@ -912,6 +945,25 @@ class GeminiApp(QMainWindow):
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
 
+    # --- NEW: Display the final summary report pop-up ---
+    @Slot(list)
+    def show_issues_report(self, issues):
+        if not issues:
+            self.status_bar.showMessage("✅ Task finished perfectly with no errors.", 5000)
+        else:
+            issue_text = "\n".join([f"• {issue}" for issue in issues])
+            
+            # 1. Append it clearly to the bottom of the output box
+            summary_block = f"\n\n{'='*50}\n⚠️ TASK COMPLETED WITH WARNINGS ⚠️\nThe following batches require manual review:\n\n{issue_text}\n{'='*50}\n"
+            self.response_output.append(summary_block)
+            
+            # 2. Pop up a highly visible warning box
+            QMessageBox.warning(self, "Task Completed with Issues", 
+                                f"The OCR batch task has finished, but {len(issues)} issue(s) were found.\n\n"
+                                f"{issue_text}\n\n"
+                                f"A summary has been added to the bottom of your output text.")
+    # ----------------------------------------------------
+
     @Slot(str)
     def handle_partial_response(self, response_text):
         self.response_output.append(response_text + "\n" + ("-"*40) + "\n")
@@ -920,8 +972,8 @@ class GeminiApp(QMainWindow):
 
     @Slot()
     def handle_all_completed(self):
-        self.status_bar.showMessage("✅ All tasks completed successfully!", 5000) 
-        self.append_to_log("SUCCESS: All tasks completed.")
+        self.status_bar.showMessage("✅ All tasks completed.", 5000) 
+        self.append_to_log("Finished processing background thread.")
         self.check_inputs()
 
     @Slot(str)
