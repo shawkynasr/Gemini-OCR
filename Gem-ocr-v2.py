@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QTextEdit, QPushButton, QFileDialog,
     QStatusBar, QFrame, QSizePolicy, QComboBox,
-    QDialog, QCheckBox, QSpinBox, QDoubleSpinBox, QMessageBox  # <== NEW: Added QMessageBox for popups
+    QDialog, QCheckBox, QSpinBox, QDoubleSpinBox, QMessageBox
 )
 from PySide6.QtGui import QPixmap
 
@@ -87,7 +87,7 @@ class RequestWorker(QObject):
     error = Signal(str)
     status_update = Signal(str)
     completed_all = Signal()
-    issues_report = Signal(list) # <== NEW: Signal to send the final error list to the GUI
+    issues_report = Signal(list)
 
     def __init__(self, api_key, model_name, prompt_text, image_paths, file_path,
                  pdf_dpi=300, image_batch_size=10, delay_seconds=60, 
@@ -297,7 +297,11 @@ class RequestWorker(QObject):
             ]
 
             total_jobs = len(jobs)
-            issues_found = []  # <== NEW: List to track all issues silently during the loop
+            issues_found = []  
+
+            # === 💡 自动重试机制配置 ===
+            MAX_RETRIES = 2
+            RETRY_DELAY = 20
 
             for i, job in enumerate(jobs):
                 job_content = job["content"]
@@ -306,50 +310,80 @@ class RequestWorker(QObject):
                 payload = [prompt] 
                 payload.extend(job_content) 
                 
-                try:
-                    response = model.generate_content(payload, safety_settings=custom_safety_settings)
-                    
-                    if not response.candidates:
-                        text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Google API completely blocked this page.]\n"
-                        self.status_update.emit(f"❌ Warning: Batch {i+1} blocked by API.")
-                        issues_found.append(f"Batch {i+1}: Blocked by API (Empty response)")
-                    else:
-                        finish_reason = response.candidates[0].finish_reason
+                text_response = ""
+                success = False
+
+                # 💡 新增：重试循环
+                for attempt in range(MAX_RETRIES + 1):
+                    try:
+                        # 强制最大输出字数，防止 MAX_TOKENS 错误，同时调低温度提高准确度
+                        custom_generation_config = genai.types.GenerationConfig(
+                            max_output_tokens=8192,
+                            temperature=0.1
+                        )
                         
-                        if finish_reason == 3:
-                            text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Blocked by Google SAFETY filters.]\n"
-                            self.status_update.emit(f"❌ Warning: Batch {i+1} blocked (SAFETY).")
-                            issues_found.append(f"Batch {i+1}: Blocked by SAFETY filters")
-                        elif finish_reason == 8:
-                            text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Blocked by Google PROHIBITED_CONTENT.]\n"
-                            self.status_update.emit(f"❌ Warning: Batch {i+1} blocked (PROHIBITED).")
-                            issues_found.append(f"Batch {i+1}: Blocked by PROHIBITED_CONTENT")
-                        elif finish_reason == 2:
-                            text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Reached MAX_TOKENS limit.]\n"
-                            self.status_update.emit(f"❌ Warning: Batch {i+1} stopped (MAX TOKENS).")
-                            issues_found.append(f"Batch {i+1}: Stopped due to MAX_TOKENS")
+                        response = model.generate_content(
+                            payload, 
+                            safety_settings=custom_safety_settings,
+                            generation_config=custom_generation_config
+                        )
+                        
+                        if not response.candidates:
+                            text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Google API completely blocked this page.]\n"
+                            self.status_update.emit(f"❌ Warning: Batch {i+1} blocked by API.")
+                            issues_found.append(f"Batch {i+1}: Blocked by API (Empty response)")
+                            break # 安全拦截不重试
                         else:
-                            try:
-                                text_response = response.text
-                            except Exception as e:
-                                text_response = f"\n[⚠️ WARNING: Batch {i+1} returned empty text. Error: {e}]\n"
-                                self.status_update.emit(f"❌ Warning: Batch {i+1} extraction failed.")
-                                issues_found.append(f"Batch {i+1}: Text extraction failed ({str(e)})")
+                            finish_reason = response.candidates[0].finish_reason
+                            
+                            if finish_reason == 3:
+                                text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Blocked by Google SAFETY filters.]\n"
+                                self.status_update.emit(f"❌ Warning: Batch {i+1} blocked (SAFETY).")
+                                issues_found.append(f"Batch {i+1}: Blocked by SAFETY filters")
+                                break # 安全拦截不重试
+                            elif finish_reason == 8:
+                                text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Blocked by Google PROHIBITED_CONTENT.]\n"
+                                self.status_update.emit(f"❌ Warning: Batch {i+1} blocked (PROHIBITED).")
+                                issues_found.append(f"Batch {i+1}: Blocked by PROHIBITED_CONTENT")
+                                break # 安全拦截不重试
+                            elif finish_reason == 2:
+                                text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Reached MAX_TOKENS limit.]\n"
+                                self.status_update.emit(f"❌ Warning: Batch {i+1} stopped (MAX TOKENS).")
+                                issues_found.append(f"Batch {i+1}: Stopped due to MAX_TOKENS")
+                                break # 字数超载不重试（请调低界面的 Batch Size）
+                            else:
+                                try:
+                                    text_response = response.text
+                                    success = True
+                                    break # 成功提取，跳出重试循环！
+                                except Exception as e:
+                                    text_response = f"\n[⚠️ WARNING: Batch {i+1} returned empty text. Error: {e}]\n"
+                                    self.status_update.emit(f"❌ Warning: Batch {i+1} extraction failed.")
+                                    issues_found.append(f"Batch {i+1}: Text extraction failed ({str(e)})")
+                                    break # 代码解析错误，不重试
 
-                    self.finished.emit(f"--- OCR Result (Batch {i+1}/{total_jobs}) ---\n{text_response}")
+                    except Exception as api_error:
+                        # 💡 如果是网络崩溃、504 超时、503 等 API 异常，进入自动重试逻辑
+                        if attempt < MAX_RETRIES:
+                            self.status_update.emit(f"⚠️ 504/API Error on Batch {i+1}. Retrying... ({attempt + 1}/{MAX_RETRIES})")
+                            self.status_update.emit(f"⏳ 强制休息 {RETRY_DELAY} 秒后自动重试...")
+                            time.sleep(RETRY_DELAY)
+                        else:
+                            error_msg = f"\n[⚠️ WARNING: Batch {i+1} Exception after {MAX_RETRIES} retries - {str(api_error)}]\n"
+                            text_response = error_msg
+                            self.status_update.emit(f"❌ API Exception on Batch {i+1} after retries: {str(api_error)}")
+                            issues_found.append(f"Batch {i+1}: API Exception ({str(api_error)})")
 
-                except Exception as api_error:
-                    error_msg = f"\n[⚠️ WARNING: Batch {i+1} Exception - {str(api_error)}]\n"
-                    self.finished.emit(f"--- OCR Result (Batch {i+1}/{total_jobs}) ---\n{error_msg}")
-                    self.status_update.emit(f"❌ API Exception on Batch {i+1}: {str(api_error)}")
-                    issues_found.append(f"Batch {i+1}: Network/API Exception ({str(api_error)})")
+                # 将最终的提取结果（或失败警告）输出到界面
+                self.finished.emit(f"--- OCR Result (Batch {i+1}/{total_jobs}) ---\n{text_response}")
                 
+                # 如果不是最后一个任务，执行标准的免费版等待延迟
                 if i < total_jobs - 1:
                     self.status_update.emit(f"... ⏳ Waiting {self.FREE_TIER_DELAY} seconds (Free Tier Limit)...")
                     time.sleep(self.FREE_TIER_DELAY)
                     
             self.status_update.emit(f"✅ All OCR tasks completed ({total_jobs}).")
-            self.issues_report.emit(issues_found)  # <== NEW: Send the report list to the GUI at the very end
+            self.issues_report.emit(issues_found)  
             
         except Exception as critical_error: 
             self.error.emit(f"Critical System Error: {critical_error}")
@@ -360,6 +394,7 @@ class RequestWorker(QObject):
 class GeminiApp(QMainWindow):
     def __init__(self):
         super().__init__()
+        # 💡 使用你指定的窗口标题
         self.setWindowTitle("Gemini-OCR V2 By (Shawky Nasr) shawkynasr@126.com")
         self.setGeometry(100, 100, 1200, 800)
         self.setLayoutDirection(Qt.LeftToRight) 
@@ -930,9 +965,7 @@ class GeminiApp(QMainWindow):
         self.worker.moveToThread(self.thread)
         self.worker.status_update.connect(self.append_to_log)
         
-        # --- NEW: Connect the summary report signal ---
         self.worker.issues_report.connect(self.show_issues_report)
-        # ----------------------------------------------
         
         self.thread.started.connect(self.worker.run)
         self.worker.finished.connect(self.handle_partial_response)
@@ -945,7 +978,6 @@ class GeminiApp(QMainWindow):
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
 
-    # --- NEW: Display the final summary report pop-up ---
     @Slot(list)
     def show_issues_report(self, issues):
         if not issues:
@@ -953,16 +985,13 @@ class GeminiApp(QMainWindow):
         else:
             issue_text = "\n".join([f"• {issue}" for issue in issues])
             
-            # 1. Append it clearly to the bottom of the output box
             summary_block = f"\n\n{'='*50}\n⚠️ TASK COMPLETED WITH WARNINGS ⚠️\nThe following batches require manual review:\n\n{issue_text}\n{'='*50}\n"
             self.response_output.append(summary_block)
             
-            # 2. Pop up a highly visible warning box
             QMessageBox.warning(self, "Task Completed with Issues", 
                                 f"The OCR batch task has finished, but {len(issues)} issue(s) were found.\n\n"
                                 f"{issue_text}\n\n"
                                 f"A summary has been added to the bottom of your output text.")
-    # ----------------------------------------------------
 
     @Slot(str)
     def handle_partial_response(self, response_text):
