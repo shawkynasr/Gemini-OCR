@@ -81,7 +81,7 @@ class ImagePreviewDialog(QDialog):
         super().resizeEvent(event)
         self.show_image()
 
-# --- (2. RequestWorker - Focused on OCR) ---
+# --- (2. RequestWorker - Focused on OCR & Auto-Saving) ---
 class RequestWorker(QObject):
     finished = Signal(str)
     error = Signal(str)
@@ -89,16 +89,20 @@ class RequestWorker(QObject):
     completed_all = Signal()
     issues_report = Signal(list)
 
-    def __init__(self, api_key, model_name, prompt_text, image_paths, file_path,
+    def __init__(self, api_key, model_name, prompt_text, image_paths, file_paths,
                  pdf_dpi=300, image_batch_size=10, delay_seconds=60, 
                  process_images_binarization=False, process_images_denoising=False,
                  process_images_resize_factor=1.0, 
                  all_pages=True, start_page=1, end_page=1,
                  num_columns=1): 
         super().__init__()
-        self.api_key = api_key; self.model_name = model_name; self.prompt_text = prompt_text
-        self.image_paths = image_paths if image_paths else []; self.file_path = file_path
-        self.PDF_DPI = pdf_dpi; self.IMAGE_BATCH_SIZE = image_batch_size
+        self.api_key = api_key
+        self.model_name = model_name
+        self.prompt_text = prompt_text
+        self.image_paths = image_paths if image_paths else []
+        self.file_paths = file_paths if file_paths else []  # <== MODIFIED: Handles multiple PDFs
+        self.PDF_DPI = pdf_dpi
+        self.IMAGE_BATCH_SIZE = image_batch_size
         self.FREE_TIER_DELAY = delay_seconds
         self.PROCESS_BINARIZATION = process_images_binarization
         self.PROCESS_DENOISING = process_images_denoising
@@ -222,9 +226,10 @@ class RequestWorker(QObject):
         else:
             return PIL.Image.fromarray(img_np)
         
-    def convert_pdf_to_images(self):
+    def convert_pdf_to_images(self, pdf_path):  # <== MODIFIED: Takes specific PDF path
         self.status_update.emit(f"... ⏳ Converting PDF to images at {self.PDF_DPI} DPI...")
-        images = []; doc = fitz.open(self.file_path)
+        images = []
+        doc = fitz.open(pdf_path)
         
         num_pages = len(doc)
         start_index = 0
@@ -261,34 +266,7 @@ class RequestWorker(QObject):
             genai.configure(api_key=self.api_key)
             model = genai.GenerativeModel(self.model_name)
             prompt = self.prompt_text
-            images_to_process = []
             
-            if self.image_paths: 
-                for p in self.image_paths:
-                    img = PIL.Image.open(p)
-                    if img.mode not in ('RGB', 'L'):
-                        img = img.convert('RGB')
-                    img_processed = self.process_single_image(img)
-                    slices = self.split_image_into_columns(img_processed)
-                    images_to_process.extend(slices)
-            
-            if self.file_path:
-                file_ext = os.path.splitext(self.file_path)[1].lower()
-                if file_ext == '.pdf':
-                    pdf_images = self.convert_pdf_to_images()
-                    images_to_process.extend(pdf_images)
-                else:
-                    self.status_update.emit(f"Warning: File type {file_ext} not supported. Ignoring.")
-
-            if not images_to_process:
-                raise Exception("No images or PDF found for OCR processing.")
-            
-            jobs = []
-            image_batches = [images_to_process[i:i+self.IMAGE_BATCH_SIZE] 
-                             for i in range(0, len(images_to_process), self.IMAGE_BATCH_SIZE)]
-            for batch in image_batches: 
-                jobs.append( {"type": "image_batch", "content": batch} )
-
             custom_safety_settings = [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
                 {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -296,93 +274,212 @@ class RequestWorker(QObject):
                 {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
             ]
 
-            total_jobs = len(jobs)
-            issues_found = []  
-
-            # === 💡 自动重试机制配置 ===
             MAX_RETRIES = 2
             RETRY_DELAY = 20
+            issues_found = []
 
-            for i, job in enumerate(jobs):
-                job_content = job["content"]
-                self.status_update.emit(f"... 🚀 Sending image batch {i+1} of {total_jobs}...")
+            # ==========================================
+            # 1. PROCESS STANDALONE IMAGES FOLDER
+            # ==========================================
+            if self.image_paths: 
+                self.status_update.emit("=== 🖼️ Processing Standalone Images ===")
+                images_to_process = []
+                for p in self.image_paths:
+                    img = PIL.Image.open(p)
+                    if img.mode not in ('RGB', 'L'):
+                        img = img.convert('RGB')
+                    img_processed = self.process_single_image(img)
+                    slices = self.split_image_into_columns(img_processed)
+                    images_to_process.extend(slices)
                 
-                payload = [prompt] 
-                payload.extend(job_content) 
-                
-                text_response = ""
-                success = False
+                if images_to_process:
+                    jobs = []
+                    image_batches = [images_to_process[i:i+self.IMAGE_BATCH_SIZE] 
+                                     for i in range(0, len(images_to_process), self.IMAGE_BATCH_SIZE)]
+                    for batch in image_batches: 
+                        jobs.append( {"type": "image_batch", "content": batch} )
 
-                # 💡 新增：重试循环
-                for attempt in range(MAX_RETRIES + 1):
-                    try:
-                        # 强制最大输出字数，防止 MAX_TOKENS 错误，同时调低温度提高准确度
-                        custom_generation_config = genai.types.GenerationConfig(
-                            max_output_tokens=8192,
-                            temperature=0.1
-                        )
+                    total_jobs = len(jobs)
+
+                    for i, job in enumerate(jobs):
+                        job_content = job["content"]
+                        self.status_update.emit(f"... 🚀 Sending image batch {i+1} of {total_jobs}...")
                         
-                        response = model.generate_content(
-                            payload, 
-                            safety_settings=custom_safety_settings,
-                            generation_config=custom_generation_config
-                        )
+                        payload = [prompt] 
+                        payload.extend(job_content) 
+                        text_response = ""
                         
-                        if not response.candidates:
-                            text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Google API completely blocked this page.]\n"
-                            self.status_update.emit(f"❌ Warning: Batch {i+1} blocked by API.")
-                            issues_found.append(f"Batch {i+1}: Blocked by API (Empty response)")
-                            break # 安全拦截不重试
-                        else:
-                            finish_reason = response.candidates[0].finish_reason
-                            
-                            if finish_reason == 3:
-                                text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Blocked by Google SAFETY filters.]\n"
-                                self.status_update.emit(f"❌ Warning: Batch {i+1} blocked (SAFETY).")
-                                issues_found.append(f"Batch {i+1}: Blocked by SAFETY filters")
-                                break # 安全拦截不重试
-                            elif finish_reason == 8:
-                                text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Blocked by Google PROHIBITED_CONTENT.]\n"
-                                self.status_update.emit(f"❌ Warning: Batch {i+1} blocked (PROHIBITED).")
-                                issues_found.append(f"Batch {i+1}: Blocked by PROHIBITED_CONTENT")
-                                break # 安全拦截不重试
-                            elif finish_reason == 2:
-                                text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Reached MAX_TOKENS limit.]\n"
-                                self.status_update.emit(f"❌ Warning: Batch {i+1} stopped (MAX TOKENS).")
-                                issues_found.append(f"Batch {i+1}: Stopped due to MAX_TOKENS")
-                                break # 字数超载不重试（请调低界面的 Batch Size）
-                            else:
-                                try:
-                                    text_response = response.text
-                                    success = True
-                                    break # 成功提取，跳出重试循环！
-                                except Exception as e:
-                                    text_response = f"\n[⚠️ WARNING: Batch {i+1} returned empty text. Error: {e}]\n"
-                                    self.status_update.emit(f"❌ Warning: Batch {i+1} extraction failed.")
-                                    issues_found.append(f"Batch {i+1}: Text extraction failed ({str(e)})")
-                                    break # 代码解析错误，不重试
+                        for attempt in range(MAX_RETRIES + 1):
+                            try:
+                                custom_generation_config = genai.types.GenerationConfig(
+                                    max_output_tokens=8192,
+                                    temperature=0.1
+                                )
+                                
+                                response = model.generate_content(
+                                    payload, 
+                                    safety_settings=custom_safety_settings,
+                                    generation_config=custom_generation_config
+                                )
+                                
+                                if not response.candidates:
+                                    text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Google API completely blocked this page.]\n"
+                                    self.status_update.emit(f"❌ Warning: Batch {i+1} blocked by API.")
+                                    issues_found.append(f"Images Batch {i+1}: Blocked by API (Empty response)")
+                                    break
+                                else:
+                                    finish_reason = response.candidates[0].finish_reason
+                                    
+                                    if finish_reason == 3:
+                                        text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Blocked by Google SAFETY filters.]\n"
+                                        self.status_update.emit(f"❌ Warning: Batch {i+1} blocked (SAFETY).")
+                                        issues_found.append(f"Images Batch {i+1}: Blocked by SAFETY filters")
+                                        break 
+                                    elif finish_reason == 8:
+                                        text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Blocked by Google PROHIBITED_CONTENT.]\n"
+                                        self.status_update.emit(f"❌ Warning: Batch {i+1} blocked (PROHIBITED).")
+                                        issues_found.append(f"Images Batch {i+1}: Blocked by PROHIBITED_CONTENT")
+                                        break 
+                                    elif finish_reason == 2:
+                                        text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Reached MAX_TOKENS limit.]\n"
+                                        self.status_update.emit(f"❌ Warning: Batch {i+1} stopped (MAX TOKENS).")
+                                        issues_found.append(f"Images Batch {i+1}: Stopped due to MAX_TOKENS")
+                                        break 
+                                    else:
+                                        try:
+                                            text_response = response.text
+                                            break 
+                                        except Exception as e:
+                                            text_response = f"\n[⚠️ WARNING: Batch {i+1} returned empty text. Error: {e}]\n"
+                                            self.status_update.emit(f"❌ Warning: Batch {i+1} extraction failed.")
+                                            issues_found.append(f"Images Batch {i+1}: Text extraction failed ({str(e)})")
+                                            break 
 
-                    except Exception as api_error:
-                        # 💡 如果是网络崩溃、504 超时、503 等 API 异常，进入自动重试逻辑
-                        if attempt < MAX_RETRIES:
-                            self.status_update.emit(f"⚠️ 504/API Error on Batch {i+1}. Retrying... ({attempt + 1}/{MAX_RETRIES})")
-                            self.status_update.emit(f"⏳ 强制休息 {RETRY_DELAY} 秒后自动重试...")
-                            time.sleep(RETRY_DELAY)
-                        else:
-                            error_msg = f"\n[⚠️ WARNING: Batch {i+1} Exception after {MAX_RETRIES} retries - {str(api_error)}]\n"
-                            text_response = error_msg
-                            self.status_update.emit(f"❌ API Exception on Batch {i+1} after retries: {str(api_error)}")
-                            issues_found.append(f"Batch {i+1}: API Exception ({str(api_error)})")
+                            except Exception as api_error:
+                                if attempt < MAX_RETRIES:
+                                    self.status_update.emit(f"⚠️ 504/API Error on Batch {i+1}. Retrying... ({attempt + 1}/{MAX_RETRIES})")
+                                    self.status_update.emit(f"⏳ 强制休息 {RETRY_DELAY} 秒后自动重试...")
+                                    time.sleep(RETRY_DELAY)
+                                else:
+                                    error_msg = f"\n[⚠️ WARNING: Batch {i+1} Exception after {MAX_RETRIES} retries - {str(api_error)}]\n"
+                                    text_response = error_msg
+                                    self.status_update.emit(f"❌ API Exception on Batch {i+1} after retries: {str(api_error)}")
+                                    issues_found.append(f"Images Batch {i+1}: API Exception ({str(api_error)})")
 
-                # 将最终的提取结果（或失败警告）输出到界面
-                self.finished.emit(f"--- OCR Result (Batch {i+1}/{total_jobs}) ---\n{text_response}")
-                
-                # 如果不是最后一个任务，执行标准的免费版等待延迟
-                if i < total_jobs - 1:
-                    self.status_update.emit(f"... ⏳ Waiting {self.FREE_TIER_DELAY} seconds (Free Tier Limit)...")
-                    time.sleep(self.FREE_TIER_DELAY)
+                        self.finished.emit(f"--- OCR Result (Images Batch {i+1}/{total_jobs}) ---\n{text_response}")
+                        if i < total_jobs - 1:
+                            time.sleep(self.FREE_TIER_DELAY)
+
+            # ==========================================
+            # 2. PROCESS PDFs (BATCH & AUTO-SAVE)
+            # ==========================================
+            if self.file_paths:
+                total_pdfs = len(self.file_paths)
+                for pdf_idx, pdf_path in enumerate(self.file_paths):
+                    pdf_name = os.path.basename(pdf_path)
+                    self.status_update.emit(f"\n{'='*40}\n=== 📄 Starting PDF {pdf_idx+1}/{total_pdfs}: {pdf_name} ===\n{'='*40}")
                     
-            self.status_update.emit(f"✅ All OCR tasks completed ({total_jobs}).")
+                    pdf_images = self.convert_pdf_to_images(pdf_path)
+                    
+                    if not pdf_images:
+                        self.status_update.emit(f"⚠️ Warning: File {pdf_name} yielded no images. Skipping.")
+                        continue
+                    
+                    jobs = []
+                    image_batches = [pdf_images[i:i+self.IMAGE_BATCH_SIZE] 
+                                     for i in range(0, len(pdf_images), self.IMAGE_BATCH_SIZE)]
+                    for batch in image_batches: 
+                        jobs.append( {"type": "image_batch", "content": batch} )
+
+                    total_jobs = len(jobs)
+                    pdf_full_text = "" # Store all text for this specific PDF
+                    
+                    for i, job in enumerate(jobs):
+                        job_content = job["content"]
+                        self.status_update.emit(f"... 🚀 Sending {pdf_name} batch {i+1} of {total_jobs}...")
+                        
+                        payload = [prompt] 
+                        payload.extend(job_content) 
+                        text_response = ""
+                        
+                        for attempt in range(MAX_RETRIES + 1):
+                            try:
+                                custom_generation_config = genai.types.GenerationConfig(
+                                    max_output_tokens=8192,
+                                    temperature=0.1
+                                )
+                                
+                                response = model.generate_content(
+                                    payload, 
+                                    safety_settings=custom_safety_settings,
+                                    generation_config=custom_generation_config
+                                )
+                                
+                                if not response.candidates:
+                                    text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Google API completely blocked this page.]\n"
+                                    self.status_update.emit(f"❌ Warning: Batch {i+1} blocked by API.")
+                                    issues_found.append(f"{pdf_name} Batch {i+1}: Blocked by API")
+                                    break
+                                else:
+                                    finish_reason = response.candidates[0].finish_reason
+                                    
+                                    if finish_reason == 3:
+                                        text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Blocked by Google SAFETY filters.]\n"
+                                        self.status_update.emit(f"❌ Warning: Batch {i+1} blocked (SAFETY).")
+                                        issues_found.append(f"{pdf_name} Batch {i+1}: Blocked by SAFETY filters")
+                                        break 
+                                    elif finish_reason == 8:
+                                        text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Blocked by Google PROHIBITED_CONTENT.]\n"
+                                        self.status_update.emit(f"❌ Warning: Batch {i+1} blocked (PROHIBITED).")
+                                        issues_found.append(f"{pdf_name} Batch {i+1}: Blocked by PROHIBITED_CONTENT")
+                                        break 
+                                    elif finish_reason == 2:
+                                        text_response = f"\n[⚠️ WARNING: Batch {i+1} Failed. Reached MAX_TOKENS limit.]\n"
+                                        self.status_update.emit(f"❌ Warning: Batch {i+1} stopped (MAX TOKENS).")
+                                        issues_found.append(f"{pdf_name} Batch {i+1}: Stopped due to MAX_TOKENS")
+                                        break 
+                                    else:
+                                        try:
+                                            text_response = response.text
+                                            break 
+                                        except Exception as e:
+                                            text_response = f"\n[⚠️ WARNING: Batch {i+1} returned empty text. Error: {e}]\n"
+                                            self.status_update.emit(f"❌ Warning: Batch {i+1} extraction failed.")
+                                            issues_found.append(f"{pdf_name} Batch {i+1}: Text extraction failed")
+                                            break 
+
+                            except Exception as api_error:
+                                if attempt < MAX_RETRIES:
+                                    self.status_update.emit(f"⚠️ 504/API Error on Batch {i+1}. Retrying... ({attempt + 1}/{MAX_RETRIES})")
+                                    time.sleep(RETRY_DELAY)
+                                else:
+                                    error_msg = f"\n[⚠️ WARNING: Batch {i+1} Exception - {str(api_error)}]\n"
+                                    text_response = error_msg
+                                    self.status_update.emit(f"❌ API Exception on Batch {i+1}")
+                                    issues_found.append(f"{pdf_name} Batch {i+1}: API Exception")
+
+                        # Add the text to the document's full text
+                        pdf_full_text += text_response + "\n\n"
+                        self.finished.emit(f"--- OCR Result ({pdf_name} - Batch {i+1}/{total_jobs}) ---\n{text_response}")
+                        
+                        if i < total_jobs - 1 or pdf_idx < total_pdfs - 1:
+                            time.sleep(self.FREE_TIER_DELAY)
+
+                    # 💡 AUTO-SAVE THE PDF'S TEXT TO DISK
+                    out_md_path = os.path.splitext(pdf_path)[0] + "_OCR.md"
+                    try:
+                        with open(out_md_path, "w", encoding="utf-8") as f:
+                            f.write(pdf_full_text)
+                        self.status_update.emit(f"✅ 💾 Auto-saved Markdown to: {out_md_path}")
+                    except Exception as e:
+                        self.status_update.emit(f"❌ Failed to auto-save {pdf_name}: {str(e)}")
+                        issues_found.append(f"{pdf_name}: Auto-save Failed ({str(e)})")
+
+            # Check if nothing was processed
+            if not self.image_paths and not self.file_paths:
+                raise Exception("No images or PDF found for OCR processing.")
+                
+            self.status_update.emit(f"✅ All OCR tasks completed.")
             self.issues_report.emit(issues_found)  
             
         except Exception as critical_error: 
@@ -394,7 +491,6 @@ class RequestWorker(QObject):
 class GeminiApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        # 💡 使用你指定的窗口标题
         self.setWindowTitle("Gemini-OCR V2 By (Shawky Nasr) shawkynasr@126.com")
         self.setGeometry(100, 100, 1200, 800)
         self.setLayoutDirection(Qt.LeftToRight) 
@@ -417,7 +513,7 @@ class GeminiApp(QMainWindow):
 6.  **Clean Output:** Return **ONLY the extracted text** without any explanations, introductions, or markdown code blocks tags."""
         
         self.current_image_paths = [] 
-        self.current_file_path = None
+        self.current_file_paths = [] # <== MODIFIED: Array to hold multiple PDFs
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -474,7 +570,7 @@ class GeminiApp(QMainWindow):
         
         # 2. Load PDF
         file_layout = QVBoxLayout()
-        self.select_file_button = QPushButton("📄 2. Select Scanned PDF File")
+        self.select_file_button = QPushButton("📄 2. Select PDF File(s) For Batch") # <== MODIFIED
         file_layout.addWidget(self.select_file_button)
         self.file_preview_label = QLabel("No file selected.")
         self.file_preview_label.setAlignment(Qt.AlignCenter)
@@ -616,7 +712,7 @@ class GeminiApp(QMainWindow):
         right_column_layout.addWidget(self.response_output, 5)
         
         tools_layout = QHBoxLayout()
-        self.save_button = QPushButton("💾 Save Result...")
+        self.save_button = QPushButton("💾 Manual Save Result...")
         self.save_button.setEnabled(False)
         tools_layout.addWidget(self.save_button)
         self.clear_button = QPushButton("🧹 Clear All")
@@ -763,9 +859,9 @@ class GeminiApp(QMainWindow):
         self.prompt_input.setText(self.DEFAULT_OCR_PROMPT)
         self.response_output.clear()
         self.current_image_paths = []
+        self.current_file_paths = [] # <== MODIFIED
         self.image_status_label.setText("No images loaded.")
         self.view_images_button.setEnabled(False)
-        self.current_file_path = None
         self.file_preview_label.setText("No file selected.")
         self.model_combo.setCurrentIndex(0)
         self.binarization_checkbox.setChecked(True)
@@ -790,7 +886,7 @@ class GeminiApp(QMainWindow):
     @Slot()
     def check_inputs(self):
         api_key_ok = bool(self.api_key_input.text().strip()); 
-        image_ok = bool(self.current_image_paths); file_ok = bool(self.current_file_path)
+        image_ok = bool(self.current_image_paths); file_ok = bool(self.current_file_paths) # <== MODIFIED
         self.send_button.setEnabled(api_key_ok and (image_ok or file_ok))
         self.view_images_button.setEnabled(image_ok)
 
@@ -845,26 +941,36 @@ class GeminiApp(QMainWindow):
 
     @Slot()
     def open_file_dialog(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select Scanned PDF File", "", "PDF Files (*.pdf)")
-        if file_path:
-            self.current_file_path = file_path
-            self.file_preview_label.setText(f"Selected File: {os.path.basename(file_path)}")
-            self.append_to_log(f"PDF File Loaded: {os.path.basename(file_path)}")
+        # <== MODIFIED: Uses getOpenFileNames to allow selecting multiple PDFs
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "Select Scanned PDF File(s)", "", "PDF Files (*.pdf)")
+        
+        if file_paths:
+            self.current_file_paths = file_paths
+            if len(file_paths) == 1:
+                self.file_preview_label.setText(f"Selected File: {os.path.basename(file_paths[0])}")
+            else:
+                self.file_preview_label.setText(f"Selected {len(file_paths)} PDF Files.")
+            self.append_to_log(f"Loaded {len(file_paths)} PDF File(s).")
         else:
-            self.current_file_path = None
+            self.current_file_paths = []
             self.file_preview_label.setText("No file selected.")
             
-        if file_path:
-            try:
-                doc = fitz.open(file_path)
-                num_pages = len(doc)
-                self.start_page_spin.setRange(1, num_pages)
-                self.end_page_spin.setRange(1, num_pages)
-                self.end_page_spin.setValue(num_pages) 
-                self.append_to_log(f"Detected {num_pages} pages in PDF.")
-                doc.close()
-            except Exception as e:
-                self.append_to_log(f"Warning: Failed reading PDF pages - {e}")
+        if file_paths:
+            if len(file_paths) == 1:
+                try:
+                    doc = fitz.open(file_paths[0])
+                    num_pages = len(doc)
+                    self.start_page_spin.setRange(1, num_pages)
+                    self.end_page_spin.setRange(1, num_pages)
+                    self.end_page_spin.setValue(num_pages) 
+                    self.append_to_log(f"Detected {num_pages} pages in PDF.")
+                    doc.close()
+                except Exception as e:
+                    self.append_to_log(f"Warning: Failed reading PDF pages - {e}")
+                    self.start_page_spin.setRange(1, 9999)
+                    self.end_page_spin.setRange(1, 9999)
+            else:
+                # If multiple PDFs, reset the generic spin ranges
                 self.start_page_spin.setRange(1, 9999)
                 self.end_page_spin.setRange(1, 9999)
 
@@ -931,7 +1037,7 @@ class GeminiApp(QMainWindow):
         model = self.model_combo.currentText()
         prompt = self.prompt_input.toPlainText()
         image_paths = self.current_image_paths
-        file_path = self.current_file_path
+        file_paths = self.current_file_paths # <== MODIFIED
         
         process_images_binarization = self.binarization_checkbox.isChecked()
         process_images_denoising = self.denoising_checkbox.isChecked()
@@ -949,13 +1055,13 @@ class GeminiApp(QMainWindow):
         
         if not model: self.handle_error("Please select a model from the list first."); return
         
-        if file_path and not all_pages and start_page > end_page:
+        if file_paths and not all_pages and start_page > end_page:
             self.handle_error("Logic Error: Start page must be less than or equal to End page.")
             self.send_button.setEnabled(True)
             return
 
         self.thread = QThread()
-        self.worker = RequestWorker(api_key, model, prompt, image_paths, file_path, 
+        self.worker = RequestWorker(api_key, model, prompt, image_paths, file_paths, # <== MODIFIED
                                     pdf_dpi, image_batch_size, delay_seconds,
                                     process_images_binarization, 
                                     process_images_denoising, 
