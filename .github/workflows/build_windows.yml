@@ -21,11 +21,11 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install PyQt6 pymupdf requests pyinstaller google-genai pydantic opencv-python pandas pillow
+          pip install PySide6 pymupdf requests pyinstaller google-genai pydantic opencv-python pandas pillow
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller --name "Gemini-OCR" --onefile --windowed --noconsole --clean --hidden-import google.genai --collect-all google.genai --copy-metadata google-genai Gem-ocr-v2.py
+          pyinstaller --name "Gemini-OCR" --onefile --windowed --noconsole --clean --hidden-import pydantic --hidden-import google.genai --collect-all google.genai --copy-metadata google-genai Gem-ocr-v2.py
 
       - name: List dist directory (Debug)
         run: dir dist
