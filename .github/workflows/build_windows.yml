@@ -18,7 +18,7 @@ jobs:
         python-version: '3.11'
 
     - name: Build Windows EXE with PyInstaller
-        run: |
+            run: |
           pyinstaller --noconfirm --windowed --onefile --hidden-import google.genai --hidden-import pydantic --copy-metadata google-genai Gem-ocr-v2.py
 
     - name: Build with PyInstaller
