@@ -18,8 +18,8 @@ jobs:
         python-version: '3.11'
 
     - name: Build Windows EXE with PyInstaller
-            run: |
-          pyinstaller --noconfirm --windowed --onefile --hidden-import google.genai --hidden-import pydantic --copy-metadata google-genai Gem-ocr-v2.py
+      run: |
+        pyinstaller --noconfirm --windowed --onefile --hidden-import google.genai --hidden-import pydantic --copy-metadata google-genai Gem-ocr-v2.py
 
     - name: Build with PyInstaller
       # تم تعديل الأمر ليناسب اسم ملفك الجديد + إضافة --onefile لدمج الملفات
