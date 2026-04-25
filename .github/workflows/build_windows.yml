@@ -10,29 +10,28 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-    - name: Build Windows EXE with PyInstaller
-      run: |
-        pyinstaller --noconfirm --windowed --onefile --hidden-import google.genai --hidden-import pydantic --copy-metadata google-genai Gem-ocr-v2.py
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyQt6 pymupdf requests pyinstaller google-genai pydantic opencv-python pandas pillow
 
-    - name: Build with PyInstaller
-      # تم تعديل الأمر ليناسب اسم ملفك الجديد + إضافة --onefile لدمج الملفات
-      run: |
-        pyinstaller --name "Gemini-OCR v2" --onefile --windowed --noconsole --clean Gem-ocr-v2.py
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --name "Gemini-OCR" --onefile --windowed --noconsole --clean --hidden-import google.genai --collect-all google.genai --copy-metadata google-genai Gem-ocr-v2.py
 
-    - name: List dist directory (Debug)
-      # للتأكد من الملفات الموجودة
-      run: dir dist
+      - name: List dist directory (Debug)
+        run: dir dist
 
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: Gemini-OCR-v2-Windows
-        # استخدام النجمة لرفع أي ملف exe مهما كان اسمه (لتجنب مشاكل المسافات)
-        path: dist/*.exe
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gemini-OCR-Windows
+          path: dist/*.exe
